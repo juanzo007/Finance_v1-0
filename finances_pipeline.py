@@ -1,353 +1,304 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-finances_pipeline.py
-- OCR images in data/test-images
-- Extract Date/Time (date_extractor.py)
-- Extract THB Withdrawal (amount_extractor.py)
-- Extract Description (description_extractor.py) and Note (note_extractor.py)
-- Write to Finances.xlsx in project root
-- Finalize numbers to 2 decimals
-- Store bare filename; add "Open" hyperlink to image
+finances_pipeline.py — schema-preserving pipeline with per-extractor DEBUG logs.
 """
 
 from __future__ import annotations
-
-import importlib.util
 import os
+import re
 import sys
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Tuple
+import importlib.util
 
 import pandas as pd
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
+from paddleocr import PaddleOCR
 
-# ---------- OCR libs ----------
-try:
-    from PIL import Image, ImageOps, ImageFilter
-except Exception:
-    Image = None
-    ImageOps = None
-    ImageFilter = None
+# --- Paths ---
+ROOT = Path(__file__).resolve().parent
+IMG_DIR = ROOT / "data" / "test-images"
+OUT_XLSX = ROOT / "Finances.xlsx"
 
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
+# Make sure our helpers are preferred over site-packages collisions (e.g., PaddleOCR's utils)
+TOOLS_DIR = str(ROOT / "scripts" / "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
 
-# ---------- Paths ----------
-HERE = Path(__file__).resolve().parent
-IMG_DIR = HERE / "data" / "test-images"
-EXTRACTOR_DATE_PATH = HERE / "scripts" / "image-scipts" / "date_extractor.py"
-EXTRACTOR_AMOUNT_PATH = HERE / "scripts" / "image-scipts" / "amount_extractor.py"
-EXTRACTOR_DESC_PATH = HERE / "scripts" / "image-scipts" / "description_extractor.py"
-EXTRACTOR_NOTE_PATH = HERE / "scripts" / "image-scipts" / "note_extractor.py"
-OUT_XLSX = HERE / "Finances.xlsx"
+SCRIPTS_DIR = ROOT / "scripts" / "image-scripts"
+EXTRACTORS = {
+    "date": SCRIPTS_DIR / "date_extractor.py",
+    "amount": SCRIPTS_DIR / "amount_extractor.py",
+    "description": SCRIPTS_DIR / "description_extractor.py",
+    "note": SCRIPTS_DIR / "note_extractor.py",  # may be missing; handled gracefully
+}
 
-HEADERS = [
-    "Date",
-    "Time",
-    "THB Withdrawal",
-    "THB Deposit",
-    "USD Amount",
-    "FX rate",
-    "Description",
-    "Acct #",
-    "Merchant_ID",
-    "Note",
-    "Sub_Category",
-    "Category",
-    "Filename",
-    "Source",
-    "Open File",
-]
-TEXT_COLS = ["Description", "Note", "Filename", "Source", "Open File"]
+DEBUG = os.environ.get("PIPE_DEBUG", "0") == "1"
 
 
-# ---------- Utils ----------
-def _log(msg: str):
-    print(msg)
+# --- Logging helpers ---
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def _ensure_tesseract():
-    if pytesseract is None:
-        return
-    if os.name == "nt":
-        guess = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        if os.path.exists(guess):
-            pytesseract.pytesseract.tesseract_cmd = guess
+def _load_optional(name: str, path: Path):
+    """Load a module if the file exists; else return None (skip that extractor).
+    Temporarily prepend the extractor directory to sys.path so relative-like
+    imports such as `from utils import ...` resolve to the local file instead
+    of site-packages (e.g., PaddleOCR's utils).
+    """
+    import sys
 
-
-def _ocr_image(img_path: Path) -> Tuple[str, List[str]]:
-    """Return (full_text, lines). Always returns safely; never raises."""
-    if pytesseract is None or Image is None:
-        _log(f"[WARN] OCR libs missing for {img_path.name}; skipping OCR.")
-        return "", []
-
-    try:
-        img = Image.open(img_path)
-    except Exception as e:
-        _log(f"[WARN] Cannot open image {img_path.name}: {e}")
-        return "", []
-
-    # Pre-process (best-effort)
-    try:
-        img = img.convert("L")
-    except Exception:
-        pass
-    try:
-        img = ImageOps.autocontrast(img)
-    except Exception:
-        pass
-    try:
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-    except Exception:
-        pass  # ignore rankfilter quirks
-
-    # Language
-    try:
-        langs = set(pytesseract.get_languages(config=""))
-        lang = "eng+tha" if "tha" in langs else "eng"
-    except Exception:
-        lang = "eng"
-
-    # Timed OCR
-    try:
-        full = pytesseract.image_to_string(img, lang=lang, timeout=12)
-    except RuntimeError as e:
-        _log(f"[WARN] Tesseract error on {img_path.name}: {e}")
-        full = ""
-    except Exception as e:
-        _log(f"[WARN] OCR failed on {img_path.name}: {e}")
-        full = ""
-
-    lines: List[str] = (
-        [ln.strip() for ln in full.splitlines() if ln.strip()] if full.strip() else []
-    )
-
-    # Structured lines (timed)
-    try:
-        df = pytesseract.image_to_data(
-            img, lang=lang, output_type=pytesseract.Output.DATAFRAME, timeout=12
-        )
-        if df is not None:
-            df = df.dropna(subset=["text"])
-            structured = []
-            for ln in sorted(df.get("line", []).dropna().unique()):
-                row = df[df["line"] == ln]
-                s = " ".join(str(t).strip() for t in row["text"] if str(t).strip())
-                if s:
-                    structured.append(s)
-            if structured:
-                lines = structured
-    except RuntimeError as e:
-        _log(f"[WARN] Tesseract data error on {img_path.name}: {e}")
-    except Exception:
-        pass
-
-    _log(f"[OCR] {img_path.name}: {len(lines)} line(s) recognized.")
-    return full, lines
-
-
-def _dynamic_import(py_path: Path):
-    if not py_path.exists():
-        _log(f"[ERROR] Extractor not found: {py_path}")
+    _log(f"[LOAD] {name} -> {path}")
+    if not path.exists():
+        _log(f"[WARN] Extractor missing: {path.name} (skipping)")
         return None
+
+    # Temporarily put the extractor's folder at the front of sys.path
+    added = False
     try:
-        spec = importlib.util.spec_from_file_location(py_path.stem, str(py_path))
+        folder = str(path.parent)
+        if folder not in sys.path:
+            sys.path.insert(0, folder)
+            added = True
+
+        spec = importlib.util.spec_from_file_location(name, str(path))
         if not spec or not spec.loader:
-            return None
+            raise ImportError(f"Cannot load {name} from {path}")
         mod = importlib.util.module_from_spec(spec)
-        sys.modules[py_path.stem] = mod
-        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        spec.loader.exec_module(mod)
         return mod
-    except Exception as e:
-        _log(f"[ERROR] Could not import extractor {py_path.name}: {e}")
-        return None
+    finally:
+        # Restore sys.path to avoid leaking state across loads
+        if added and sys.path and sys.path[0] == folder:
+            sys.path.pop(0)
 
 
-def _ensure_headers(df: pd.DataFrame) -> pd.DataFrame:
-    for h in HEADERS:
-        if h not in df.columns:
-            df[h] = ""
-    for col in TEXT_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype("object")
-    return df[HEADERS]
+# --- OCR engine (use supported language key) ---
+_OCR = PaddleOCR(lang="en", use_angle_cls=True, show_log=False)
 
 
-def _read_or_new() -> pd.DataFrame:
-    if OUT_XLSX.exists():
-        df = pd.read_excel(OUT_XLSX, engine="openpyxl")
-        return _ensure_headers(df)
-    return _ensure_headers(pd.DataFrame(columns=HEADERS))
+def _ocr_image(p: Path) -> Tuple[str, List[str]]:
+    """Return (full_text, ordered_lines) from PaddleOCR."""
+    result = _OCR.ocr(str(p), cls=True)
+    lines: List[str] = []
+    if result and isinstance(result, list):
+        for page in result or []:
+            if not page:
+                continue
+            for _, (txt, _score) in page:
+                if not txt:
+                    continue
+                s = re.sub(r"\s+", " ", txt.strip())
+                if s:
+                    lines.append(s)
+    text = "\n".join(lines)
+    if DEBUG:
+        _log(f"[DEBUG] OCR lines for {p.name}:")
+        for i, ln in enumerate(lines):
+            _log(f"   [{i:02d}] {ln}")
+    return text, lines
 
 
-def _finalize_numbers(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["THB Withdrawal", "THB Deposit", "USD Amount", "FX rate"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-    return df
+def _coerce_amount(val: Any) -> Any:
+    """Return float if safely coercible; else blank ('')."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str) and val.strip():
+        try:
+            return float(val.replace(",", ""))
+        except Exception:
+            return ""
+    return ""
 
 
-def _save_with_excel_format(df: pd.DataFrame, path: Path):
-    """Save DataFrame with 2-decimal format + clickable 'Open' hyperlinks."""
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sheet1")
-        ws = writer.sheets["Sheet1"]
-
-        # Amount columns: enforce 2 decimals
-        for col_name in ["THB Withdrawal", "THB Deposit", "USD Amount"]:
-            if col_name in df.columns:
-                col_idx = df.columns.get_loc(col_name) + 1
-                col_letter = get_column_letter(col_idx)
-                for row in range(2, ws.max_row + 1):
-                    cell = ws[f"{col_letter}{row}"]
-                    if isinstance(cell.value, (int, float)):
-                        cell.number_format = "#,##0.00"
-
-        # Hyperlinks: show 'Open' text, link to absolute path
-        if "Open File" in df.columns and "Filename" in df.columns:
-            open_idx = df.columns.get_loc("Open File") + 1
-            fn_idx = df.columns.get_loc("Filename") + 1
-            for row in range(2, ws.max_row + 1):
-                fn_val = ws.cell(row=row, column=fn_idx).value
-                if fn_val:
-                    img_abspath = (IMG_DIR / fn_val).resolve()
-                    cell = ws.cell(row=row, column=open_idx)
-                    cell.value = "Open"
-                    cell.hyperlink = img_abspath.as_uri()  # guaranteed-open file:// URI
-                    cell.font = Font(color="0000EE", underline="single")
-
-
-def _upsert(filename_only: str, payload: Dict[str, Any]):
-    df = _read_or_new()
-
-    if (df["Filename"] == filename_only).any():
-        idx = df.index[df["Filename"] == filename_only][0]
-        for k, v in payload.items():
-            if v not in ("", None):
-                df.at[idx, k] = v
-    else:
-        row = {h: "" for h in HEADERS}
-        row.update(
-            {
-                "Filename": filename_only,
-                "Open File": filename_only,
-                "Source": "Bangkok Bank Receipt",
-            }
-        )
-        for k, v in payload.items():
-            if v not in ("", None):
-                row[k] = v
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-
-    df = _finalize_numbers(df)
-    OUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    _save_with_excel_format(df, OUT_XLSX)
-
-
-# ---------- Main ----------
 def main():
-    _ensure_tesseract()
-
-    # Import extractors
-    ext_date = _dynamic_import(EXTRACTOR_DATE_PATH)
-    ext_amount = _dynamic_import(EXTRACTOR_AMOUNT_PATH)
-    ext_desc = _dynamic_import(EXTRACTOR_DESC_PATH)
-    ext_note = _dynamic_import(EXTRACTOR_NOTE_PATH)
-
-    img_paths = (
-        [
-            p
-            for p in IMG_DIR.glob("*.*")
-            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
-        ]
-        if IMG_DIR.exists()
-        else []
-    )
-    _log(f"[INFO] Found {len(img_paths)} image(s) in {IMG_DIR}")
-
-    for img in img_paths:
-        text, lines = _ocr_image(img)
-
-        date_val, time_val, thb_withdrawal = "", "", None
-        description, note = "", ""
-
-        # ---- Date/Time via date_extractor ----
-        if ext_date and hasattr(ext_date, "extract_date_time"):
-            try:
-                out = ext_date.extract_date_time(
-                    str(img), text, lines
-                )  # {'date','time'}
-                if isinstance(out, dict):
-                    date_val = (out.get("date") or "").strip()
-                    time_val = (out.get("time") or "").strip()
-            except Exception as e:
-                _log(f"[WARN] date extract failed for {img.name}: {e}")
-
-        # ---- Amount via amount_extractor ----
-        if ext_amount and hasattr(ext_amount, "extract"):
-            try:
-                out_amt = ext_amount.extract(
-                    str(img), text, lines
-                )  # {'thb_withdrawal': float or ""}
-                if isinstance(out_amt, dict):
-                    val = out_amt.get("thb_withdrawal", "")
-                    if val not in ("", None):
-                        thb_withdrawal = round(float(val), 2)
-            except Exception as e:
-                _log(f"[WARN] amount extract failed for {img.name}: {e}")
-
-        # ---- Description / Note via their extractors ----
-        if ext_desc and hasattr(ext_desc, "extract"):
-            try:
-                od = ext_desc.extract(str(img), text, lines)
-                if isinstance(od, dict):
-                    description = (od.get("description") or "").strip()
-            except Exception as e:
-                _log(f"[WARN] description extract failed for {img.name}: {e}")
-
-        if ext_note and hasattr(ext_note, "extract"):
-            try:
-                on = ext_note.extract(str(img), text, lines)
-                if isinstance(on, dict):
-                    note = (on.get("note") or "").strip()
-            except Exception as e:
-                _log(f"[WARN] note extract failed for {img.name}: {e}")
-
-        # Sanity filter: drop classic false hits
-        if description.strip().lower() in {"verify", "veri"}:
-            description = ""
-
-        payload = {
-            "Date": date_val,
-            "Time": time_val,
-            "THB Withdrawal": thb_withdrawal,
-            "Description": description,
-            "Note": note,
-        }
-        _upsert(img.name, payload)
-
-        desc_preview = (
-            (description[:40] + "…")
-            if description and len(description) > 40
-            else (description or "(none)")
-        )
-        note_preview = (
-            (note[:40] + "…") if note and len(note) > 40 else (note or "(none)")
-        )
-
+    # Load current workbook schema (preserve headers/order exactly).
+    if OUT_XLSX.exists():
+        try:
+            df = pd.read_excel(OUT_XLSX)
+            headers = list(df.columns)
+            _log(f"[INFO] Loaded {OUT_XLSX} with {len(headers)} column(s).")
+        except Exception as e:
+            _log(f"[ERROR] Could not read {OUT_XLSX}: {e}")
+            return
+    else:
+        df = pd.DataFrame()
+        headers = []
         _log(
-            f"[OK] {img.name}\n"
-            f"   Date: {date_val or '(none)'}   Time: {time_val or '(none)'}\n"
-            f"   THB Withdrawal: {(f'{thb_withdrawal:,.2f}' if thb_withdrawal is not None else '(none)')}\n"
-            f"   Description: {desc_preview}\n"
-            f"   Note: {note_preview}"
+            f"[WARN] {OUT_XLSX} not found. No headers to map; will not create new schema."
         )
 
-    _log(f"[DONE] Updated: {OUT_XLSX}")
+    # Load extractors (optionally skip missing ones)
+    date_mod = _load_optional("date_extractor", EXTRACTORS["date"])
+    amt_mod = _load_optional("amount_extractor", EXTRACTORS["amount"])
+    desc_mod = _load_optional("description_extractor", EXTRACTORS["description"])
+    note_mod = _load_optional("note_extractor", EXTRACTORS["note"])
+
+    # Collect images
+    images: List[Path] = []
+    for pat in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+        images.extend(sorted(IMG_DIR.glob(pat)))
+
+    _log(f"[INFO] Found {len(images)} image(s) in {IMG_DIR}")
+
+    has_image_col = "Image" in headers
+
+    for img in images:
+        try:
+            text, lines = _ocr_image(img)
+            _log(f"[OCR] {img.name}: {len(lines)} line(s) recognized.")
+
+            # --- Date/Time ---
+            try:
+                d = (
+                    date_mod.extract(image_path=str(img), text=text, lines=lines)
+                    if date_mod
+                    else {}
+                )
+            except Exception as e:
+                _log(
+                    f"[EXTRACT-ERROR] {img.name} :: date_extractor: {type(e).__name__}: {e}"
+                )
+                d = {}
+            _log(f"[DEBUG] {img.name} :: date_extractor -> {d}")
+
+            # --- Amount ---
+            try:
+                a = (
+                    amt_mod.extract(image_path=str(img), text=text, lines=lines)
+                    if amt_mod
+                    else {}
+                )
+            except Exception as e:
+                _log(
+                    f"[EXTRACT-ERROR] {img.name} :: amount_extractor: {type(e).__name__}: {e}"
+                )
+                a = {}
+            _log(f"[DEBUG] {img.name} :: amount_extractor -> {a}")
+
+            # --- Description ---
+            try:
+                de = (
+                    desc_mod.extract(image_path=str(img), text=text, lines=lines)
+                    if desc_mod
+                    else {}
+                )
+            except Exception as e:
+                _log(
+                    f"[EXTRACT-ERROR] {img.name} :: description_extractor: {type(e).__name__}: {e}"
+                )
+                de = {}
+            _log(f"[DEBUG] {img.name} :: description_extractor -> {de}")
+
+            # --- Note ---
+            try:
+                n = (
+                    note_mod.extract(image_path=str(img), text=text, lines=lines)
+                    if note_mod
+                    else {}
+                )
+            except Exception as e:
+                _log(
+                    f"[EXTRACT-ERROR] {img.name} :: note_extractor: {type(e).__name__}: {e}"
+                )
+                n = {}
+            _log(f"[DEBUG] {img.name} :: note_extractor -> {n}")
+
+            # --- Build updates ONLY for existing headers ---
+            updates: Dict[str, Any] = {}
+
+            # Date / Time
+            if isinstance(d, dict):
+                if "Date" in headers and "date" in d:
+                    updates["Date"] = d.get("date", "")
+                if "Time" in headers and "time" in d:
+                    updates["Time"] = d.get("time", "")
+
+            # Amount -> Withdrawal THB (accept both keys from extractor)
+            if "Withdrawal THB" in headers and isinstance(a, dict):
+                amt_key = (
+                    "thb_withdrawal"
+                    if "thb_withdrawal" in a
+                    else ("withdrawal" if "withdrawal" in a else None)
+                )
+                if amt_key:
+                    updates["Withdrawal THB"] = _coerce_amount(a.get(amt_key, ""))
+
+            # Description -> Description/Descrition (whichever exists)
+            if isinstance(de, dict) and "description" in de:
+                desc_header = None
+                if "Descrition" in headers:
+                    desc_header = "Descrition"
+                elif "Description" in headers:
+                    desc_header = "Description"
+                if desc_header:
+                    updates[desc_header] = de.get("description", "")
+
+            # Note
+            if "Note" in headers and isinstance(n, dict) and "note" in n:
+                updates["Note"] = n.get("note", "")
+
+            # Nothing to update and no Image anchor? Skip.
+            if not updates and not has_image_col:
+                _log(f"[SKIP] {img.name}: no matching headers to update.")
+                continue
+
+            if has_image_col:
+                # Upsert by 'Image'
+                if len(df) and (df["Image"].astype(str) == img.name).any():
+                    idx = df.index[df["Image"].astype(str) == img.name][0]
+                    for k, v in updates.items():
+                        if k in headers:
+                            df.at[idx, k] = v
+                else:
+                    if headers:
+                        blank = {h: "" for h in headers}
+                        blank["Image"] = img.name
+                        for k, v in updates.items():
+                            if k in headers:
+                                blank[k] = v
+                        df = pd.concat([df, pd.DataFrame([blank])], ignore_index=True)
+                    else:
+                        _log(
+                            f"[SKIP] {img.name}: workbook has no headers; not creating new schema."
+                        )
+                        continue
+            else:
+                # No 'Image' column: append a row using only existing headers
+                if headers:
+                    row = {h: "" for h in headers}
+                    for k, v in updates.items():
+                        if k in headers:
+                            row[k] = v
+                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                else:
+                    _log(
+                        f"[SKIP] {img.name}: workbook has no headers; not creating new schema."
+                    )
+                    continue
+
+            _log(
+                f"[OK] {img.name}: "
+                + (
+                    ", ".join(f"{k}={updates[k]!r}" for k in updates)
+                    if updates
+                    else "(no updates)"
+                )
+            )
+
+        except KeyboardInterrupt:
+            _log("[ABORTED] KeyboardInterrupt")
+            raise
+        except Exception as e:
+            _log(f"[ERROR] {img.name}: {e}")
+
+    # Write back with original header order (unchanged)
+    if headers:
+        df = df[headers]
+        df.to_excel(OUT_XLSX, index=False)
+        _log(f"[DONE] Updated: {OUT_XLSX}")
+    else:
+        _log(f"[DONE] No headers found in {OUT_XLSX}; nothing written.")
 
 
 if __name__ == "__main__":

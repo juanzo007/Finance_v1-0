@@ -1,0 +1,19 @@
+# Config for your project (prefer relative paths)
+# Run from repository root: C:/Users/johnh/Projects/GPT-Finance
+project_root: "."
+
+images:
+  - "data/test-images"
+bangkok_pdfs:
+  - "data/bangkok_pdf"
+chase_pdfs:
+  - "data/chase_pdf"
+
+# Output Excel (folder will be created if needed)
+output_excel: "out/Merged_Finances.xlsx"
+
+# Optional: for image rows, store 'Filename' as this prefix + file name
+relative_image_root: "data/test-images"
+
+# Optional: print progress
+verbose: true
