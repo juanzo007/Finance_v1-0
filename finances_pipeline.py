@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import importlib.util
-
 import pandas as pd
 from paddleocr import PaddleOCR
 
@@ -109,6 +108,30 @@ def _coerce_amount(val: Any) -> Any:
         except Exception:
             return ""
     return ""
+
+
+# Add this function right before main()
+def run_post_processing():
+    """Run post-processing utilities after pipeline completion"""
+    try:
+        # Import the general-changes module
+        tools_dir = ROOT / "scripts" / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+
+        import general_changes
+
+        _log("[POST] Running post-processing...")
+
+        # Convert Image column to hyperlinks
+        general_changes.convert_image_column_to_hyperlinks()
+
+        _log("[POST] Post-processing completed.")
+
+    except Exception as e:
+        _log(f"[POST-ERROR] Post-processing failed: {e}")
+        # Don't fail the entire pipeline if post-processing fails
+        return
 
 
 def main():
@@ -297,6 +320,10 @@ def main():
         df = df[headers]
         df.to_excel(OUT_XLSX, index=False)
         _log(f"[DONE] Updated: {OUT_XLSX}")
+
+        # Run post-processing after saving
+        run_post_processing()
+
     else:
         _log(f"[DONE] No headers found in {OUT_XLSX}; nothing written.")
 
